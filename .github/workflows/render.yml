@@ -1,0 +1,129 @@
+name: Render Sun Rays Ad
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+jobs:
+  render:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate project (folder or zip)
+        id: locate
+        run: |
+          set -e
+          if [ -f package.json ]; then
+            DIR=.
+          else
+            ZIP=$(find . -name "*.zip" -not -path "./.git/*" | head -n 1)
+            if [ -z "$ZIP" ]; then
+              echo "::error::لم أجد package.json ولا ملف zip في المستودع"
+              exit 1
+            fi
+            echo "Extracting $ZIP"
+            rm -rf project_src
+            unzip -q "$ZIP" -d project_src
+            PKG=$(find project_src -name package.json -not -path "*/node_modules/*" | head -n 1)
+            if [ -z "$PKG" ]; then
+              echo "::error::لا يوجد package.json داخل الـ zip"
+              exit 1
+            fi
+            DIR=$(dirname "$PKG")
+          fi
+          echo "Project dir: $DIR"
+          echo "dir=$DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Verify required files
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          set -e
+          MISSING=0
+          for f in package.json remotion.config.ts script.txt music_spec.json \
+                   public/voice.mp3 public/logo.png \
+                   scripts/align.py scripts/make_envelope.py scripts/make_music.py \
+                   src/index.ts src/Root.tsx src/Ad.tsx src/cues.ts src/timeline.ts src/scenes.tsx src/ui.tsx src/ui3d.tsx src/brand.ts; do
+            if [ ! -f "$f" ]; then
+              echo "::error::ملف مفقود: $f"
+              MISSING=1
+            fi
+          done
+          if [ "$MISSING" -ne 0 ]; then exit 1; fi
+          echo "All required files present."
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: System libs (Chrome + ffmpeg)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y libnss3 libdbus-1-3 libatk1.0-0 libasound2 \
+            libxrandr2 libxkbcommon-x11-0 libxfixes3 libxcomposite1 \
+            libxdamage1 libgbm-dev libcups2 libatk-bridge2.0-0 ffmpeg
+
+      - name: Python deps
+        run: pip install --quiet faster-whisper numpy
+
+      # 1) توقيت كل كلمة من الصوت نفسه. يفشل الـ workflow إذا كانت المطابقة أقل من 60%
+      - name: Align words to audio
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: python3 scripts/align.py --audio public/voice.mp3 --script script.txt --out src/timing.json --model medium --lang ar
+
+      - name: Refuse estimated timing
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          python3 - <<'PY'
+          import json, sys
+          d = json.load(open('src/timing.json', encoding='utf-8'))
+          if d.get('_estimated_for_QA_only'):
+              sys.exit('timing.json تقديري، ممنوع التصيير')
+          print('Match ratio:', d.get('match_ratio'), '| Duration:', d.get('duration'))
+          print('Unmatched:', ' '.join(w['text'] for w in d['words'] if not w.get('matched')) or 'none')
+          PY
+
+      # 2) الموجة الصوتية والموسيقى من نفس التوقيت
+      - name: Audio envelope + music
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          python3 scripts/make_envelope.py
+          python3 scripts/make_music.py --timing src/timing.json --spec music_spec.json
+
+      - name: Install dependencies
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: npm install --no-audit --no-fund
+
+      - name: Ensure Remotion browser
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: npx remotion browser ensure
+
+      - name: Render 16:9 (landscape)
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          mkdir -p out
+          npx remotion render src/index.ts Ad-Landscape out/sunrays-landscape.mp4 --concurrency=1
+
+      - name: Render 9:16 (vertical)
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: npx remotion render src/index.ts Ad-Vertical out/sunrays-vertical.mp4 --concurrency=1
+
+      - name: Upload videos + timing report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sunrays-ad-videos
+          path: |
+            ${{ steps.locate.outputs.dir }}/out/*.mp4
+            ${{ steps.locate.outputs.dir }}/src/timing.json
+          if-no-files-found: warn
